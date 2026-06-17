@@ -45,7 +45,10 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main
+          git add snapshot_qogita_vitabiotics.json baseline_done_vitabiotics.txt 2>/dev/null || true
+          git stash || true
+          git pull --rebase origin main || true
+          git stash pop || true
           git add snapshot_qogita_vitabiotics.json baseline_done_vitabiotics.txt 2>/dev/null || true
           git diff --cached --quiet || git commit -m "chore: update vitabiotics snapshot [skip ci]"
           git push origin HEAD:main
