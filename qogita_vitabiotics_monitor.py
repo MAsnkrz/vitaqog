@@ -9,13 +9,14 @@ Workflow:
   4. Pick the lowest unit price offer
   5. Compare against snapshot and fire Discord alerts
 
-Tracks:
-  - New product listings
-  - Price drops / increases (lowest unit price across all offers)
-  - Restocks / stock drops
-  - Out of stock / back in stock
+Tracks (Discord alerts fire ONLY for these):
+  - New product listings (in stock only)
+  - Price drops (lowest unit price decreased >1% and >£0.02)
+  - Back in stock (was OOS, now available)
 
-Deps: pip install requests
+Does NOT alert on: price increases, stock fluctuations, going OOS.
+
+Deps: pip install requests playwright beautifulsoup4
 """
 
 import json
@@ -44,13 +45,9 @@ QOGITA_PASSWORD = os.getenv("QOGITA_PASSWORD", "")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
 # Discord colours
-COLOUR_NEW        = 0xE91E8C
-COLOUR_PRICE_DROP = 0x2ECC71
-COLOUR_PRICE_UP   = 0xE74C3C
-COLOUR_RESTOCK    = 0x3498DB
-COLOUR_LOW_STOCK  = 0xF39C12
-COLOUR_OOS        = 0x95A5A6
-COLOUR_BACK       = 0x9B59B6
+COLOUR_NEW  = 0xE91E8C   # pink — new listing
+COLOUR_BACK = 0x9B59B6   # purple — back in stock
+# Price drop colours are tiered by severity — see notify_price_change()
 
 # ---------------------------------------------------------------------------
 # AUTH
@@ -404,23 +401,39 @@ def notify_new(product):
     print(f"  Discord: NEW — {product.get('title', '')[:60]}")
 
 
-def notify_price_change(product, old_price, new_price, is_drop):
+def notify_price_change(product, old_price, new_price, pct_change):
+    """
+    pct_change is a fraction (e.g. 0.05 = 5% drop). Always a drop —
+    price increases are no longer tracked.
+    Colour tier scales with drop severity for quick visual triage.
+    """
     old_f = safe_float(old_price)
     new_f = safe_float(new_price)
     diff  = f"£{abs(new_f - old_f):.2f}" if old_f and new_f else "?"
-    pct   = f"{abs((new_f - old_f) / old_f * 100):.1f}%" if old_f and new_f else "?"
+    pct_display = f"{pct_change * 100:.1f}%"
+
+    # Colour tiers by drop severity
+    if pct_change >= 0.20:
+        colour = 0x00C853   # deep green — big drop (20%+)
+        tier   = "🔥"
+    elif pct_change >= 0.10:
+        colour = 0x2ECC71   # green — solid drop (10-20%)
+        tier   = "💰"
+    else:
+        colour = 0x82E0AA   # light green — small drop (1-10%)
+        tier   = "💵"
 
     fields = [
         {"name": "💰 Old Price", "value": f"£{old_price}",                                          "inline": True},
         {"name": "💰 New Price", "value": f"**£{new_price}**",                                      "inline": True},
-        {"name": "📉 Change",    "value": f"{'↓' if is_drop else '↑'} {diff} ({pct})",              "inline": True},
+        {"name": "📉 Drop",      "value": f"↓ {diff} (**{pct_display}**)",                          "inline": True},
         {"name": "💷 New Price (inc. VAT)", "value": f"£{vat_price(new_price)}" if new_price else "-", "inline": True},
     ] + _base_fields(product)
 
     embed = {
-        "title":     f"{'💰  PRICE DROP' if is_drop else '📈  PRICE INCREASE'} — {product.get('title', '')}",
+        "title":     f"{tier}  PRICE DROP -{pct_display} — {product.get('title', '')}",
         "url":       product.get("url", "https://www.qogita.com"),
-        "color":     COLOUR_PRICE_DROP if is_drop else COLOUR_PRICE_UP,
+        "color":     colour,
         "fields":    fields,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "footer":    {"text": "Qogita Vitabiotics Monitor • qogita.com"},
@@ -428,46 +441,7 @@ def notify_price_change(product, old_price, new_price, is_drop):
     t = _thumbnail(product)
     if t: embed["thumbnail"] = t
     _send_embed(embed)
-    print(f"  Discord: PRICE {'DROP' if is_drop else 'UP'} — {product.get('title', '')[:50]}")
-
-
-def notify_stock_change(product, old_stock, new_stock, is_restock):
-    price = product.get("price", "")
-    diff  = abs(new_stock - old_stock) if (new_stock is not None and old_stock is not None) else "?"
-    fields = [
-        {"name": "💰 Lowest Unit Price", "value": f"**£{price}**" if price else "-",        "inline": True},
-        {"name": "💷 Price (inc. VAT)",  "value": f"£{vat_price(price)}" if price else "-", "inline": True},
-        {"name": "📊 Old Stock", "value": f"{old_stock:,} units" if isinstance(old_stock, int) else "-", "inline": True},
-        {"name": "📊 New Stock", "value": f"**{new_stock:,} units**" if isinstance(new_stock, int) else "-", "inline": True},
-        {"name": "📉 Change",    "value": f"{'↑ +' if is_restock else '↓ -'}{diff:,}" if isinstance(diff, int) else "-", "inline": True},
-    ] + _base_fields(product)
-
-    embed = {
-        "title":     f"{'🟢  RESTOCK' if is_restock else '📉  STOCK DROP'} — {product.get('title', '')}",
-        "url":       product.get("url", "https://www.qogita.com"),
-        "color":     COLOUR_RESTOCK if is_restock else COLOUR_LOW_STOCK,
-        "fields":    fields,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":    {"text": "Qogita Vitabiotics Monitor • qogita.com"},
-    }
-    t = _thumbnail(product)
-    if t: embed["thumbnail"] = t
-    _send_embed(embed)
-
-
-def notify_oos(product):
-    embed = {
-        "title":     f"🔴  OUT OF STOCK — {product.get('title', '')}",
-        "url":       product.get("url", "https://www.qogita.com"),
-        "color":     COLOUR_OOS,
-        "fields":    _base_fields(product),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":    {"text": "Qogita Vitabiotics Monitor • qogita.com"},
-    }
-    t = _thumbnail(product)
-    if t: embed["thumbnail"] = t
-    _send_embed(embed)
-    print(f"  Discord: OOS — {product.get('title', '')[:60]}")
+    print(f"  Discord: PRICE DROP -{pct_display} — {product.get('title', '')[:50]}")
 
 
 def notify_back_in_stock(product):
@@ -527,10 +501,14 @@ def snapshot_entry(product):
 # ---------------------------------------------------------------------------
 
 def check_changes(product, old):
+    """
+    Only fires alerts for:
+      - Back in stock (was OOS, now has stock)
+      - Price drop (lowest unit price decreased by more than 1%)
+    No alerts for: price increases, stock fluctuations, going OOS.
+    """
     old_price    = old.get("price", "")
     new_price    = product.get("price", "")
-    old_stock    = old.get("stock")
-    new_stock    = product.get("stock")
     was_in_stock = old.get("in_stock", True)
     now_in_stock = product.get("in_stock", True)
 
@@ -541,26 +519,19 @@ def check_changes(product, old):
     old_f = safe_float(old_price)
     new_f = safe_float(new_price)
 
+    # Back in stock takes priority over price comparison
     if not was_in_stock and now_in_stock:
         notify_back_in_stock(product)
         time.sleep(1)
-    elif was_in_stock and not now_in_stock:
-        # Silently record OOS — no Discord alert
-        pass
-    elif old_f and new_f and new_f < old_f - 0.01:
-        notify_price_change(product, old_price, new_price, is_drop=True)
-        time.sleep(1)
-    elif old_f and new_f and new_f > old_f + 0.01:
-        notify_price_change(product, old_price, new_price, is_drop=False)
-        time.sleep(1)
+        return
 
-    if old_stock is not None and new_stock is not None and now_in_stock:
-        threshold = max(50, int(old_stock * 0.05))
-        if new_stock > old_stock + threshold:
-            notify_stock_change(product, old_stock, new_stock, is_restock=True)
-            time.sleep(1)
-        elif new_stock < old_stock - threshold:
-            notify_stock_change(product, old_stock, new_stock, is_restock=False)
+    # Price drop — require at least 1% AND £0.02 absolute difference
+    # to avoid noise from rounding/floating point drift
+    if old_f and new_f and old_f > 0:
+        pct_change = (old_f - new_f) / old_f
+        abs_change = old_f - new_f
+        if pct_change > 0.01 and abs_change > 0.02:
+            notify_price_change(product, old_price, new_price, pct_change)
             time.sleep(1)
 
 
@@ -607,6 +578,8 @@ def run_check():
         if not qid:
             return None
         detail = fetch_variant_detail(qid)
+        # If API returns None (404/error), skip this product entirely
+        # rather than recording it as OOS
         if detail is None:
             return None
         product = parse_variant(item, detail)
