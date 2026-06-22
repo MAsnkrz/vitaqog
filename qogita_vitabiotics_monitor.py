@@ -1,44 +1,50 @@
 """
-Qogita Maybelline Monitor — API-based
-Uses the Qogita internal API (https://api.qogita.com) instead of browser scraping.
+Qogita Vitabiotics Monitor — Catalog Download API version
+Monitors https://www.qogita.com/brands/vitabiotics/
 
-Workflow:
-  1. Authenticate via POST /auth/login/ to get a JWT token
-  2. Fetch all Maybelline variants via GET /variants/?brand_slug=maybelline
-  3. For each variant, fetch offers via GET /variants/{qid}/offers/
-  4. Pick the lowest unit price offer
-  5. Compare against snapshot and fire Discord alerts
+Uses Qogita's official public Buyer API endpoint:
+  GET /variants/search/download/?brand_name=Vitabiotics
+This single authenticated request returns the ENTIRE brand catalogue as
+a CSV in one response — no pagination, no Playwright, no per-product
+API looping. A first run that used to take 30+ minutes now takes seconds.
+
+CSV columns returned by this endpoint:
+  GTIN, Name, Category, Brand, £ Lowest Price inc. shipping, Unit,
+  Lowest Priced Offer Inventory, Is a pre-order?,
+  Estimated Delivery Time (weeks), Number of Offers,
+  Total Inventory of All Offers, Product URL, Image URL
 
 Tracks (Discord alerts fire ONLY for these):
   - New product listings (in stock only)
-  - Price drops (lowest unit price decreased >1% and >£0.02)
+  - Price drops (decreased >1% and >£0.02)
   - Back in stock (was OOS, now available)
 
 Does NOT alert on: price increases, stock fluctuations, going OOS.
 
-Deps: pip install requests playwright beautifulsoup4
+Deps: pip install requests
 """
 
+import csv
+import io
 import json
 import os
 import re
 import time
-import random
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 
 API_BASE        = "https://api.qogita.com"
-BRAND_URL       = "https://www.qogita.com/brands/vitabiotics/"
-SNAPSHOT_FILE   = "snapshot_qogita_vitabiotics.json"
-REQUEST_DELAY   = 1.0   # seconds between API calls (be polite)
-RUN_ONCE        = os.getenv("RUN_ONCE", "false").lower() == "true"
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", "1800"))  # 30 min
+BRAND_NAME       = "Vitabiotics"       # adjust if fallback attempts below are needed
+BRAND_NAME_FALLBACKS = ["VITABIOTICS", "Vita Biotics"]
+BRAND_PAGE_URL   = "https://www.qogita.com/brands/vitabiotics/"
+SNAPSHOT_FILE    = "snapshot_qogita_vitabiotics.json"
+BASELINE_FLAG    = "baseline_done_vitabiotics.txt"
+RUN_ONCE         = os.getenv("RUN_ONCE", "false").lower() == "true"
+CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", "1800"))  # 30 min
 
 QOGITA_EMAIL    = os.getenv("QOGITA_EMAIL",    "")
 QOGITA_PASSWORD = os.getenv("QOGITA_PASSWORD", "")
@@ -85,220 +91,117 @@ def auth_headers():
 
 
 # ---------------------------------------------------------------------------
-# API HELPERS
+# CATALOG DOWNLOAD — single request for the whole brand catalogue
 # ---------------------------------------------------------------------------
 
-def api_get(path, params=None, retries=3):
-    """GET from the Qogita API with auth and retry logic."""
-    url = f"{API_BASE}{path}"
+def _safe_int(val):
+    try:
+        return int(float(str(val).replace(",", "")))
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_brand_catalog(brand_name, retries=4):
+    """
+    Fetch the full brand catalogue in one request via the CSV download
+    endpoint. Returns a list of parsed product dicts, or [] on failure
+    (including if the endpoint is still rate limited after retrying).
+
+    This endpoint generates a full CSV server-side on every call and
+    appears to carry a stricter rate limit than other Qogita endpoints —
+    we respect Retry-After and back off rather than crashing the job.
+    """
+    url = f"{API_BASE}/variants/search/download/"
+    last_status = None
+
     for attempt in range(retries):
-        try:
-            r = requests.get(url, headers=auth_headers(), params=params, timeout=20)
-            if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", 10))
-                print(f"  [!] Rate limited — waiting {wait}s")
-                time.sleep(wait)
-                continue
-            if r.status_code == 401:
-                # Token expired — force refresh
-                _token_cache["token"] = None
-                r = requests.get(url, headers=auth_headers(), params=params, timeout=20)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            print(f"  [!] API error ({path}): {e} — attempt {attempt+1}/{retries}")
-            if attempt < retries - 1:
-                time.sleep(4 * (attempt + 1))
-    return None
+        r = requests.get(url, headers=auth_headers(), params={"brand_name": brand_name}, timeout=60)
+        last_status = r.status_code
 
+        if r.status_code == 401:
+            _token_cache["token"] = None
+            r = requests.get(url, headers=auth_headers(), params={"brand_name": brand_name}, timeout=60)
+            last_status = r.status_code
 
-def paginate(path, params=None):
-    """Fetch all pages from a paginated API endpoint."""
-    params = params or {}
-    params["page_size"] = 100
-    page = 1
-    all_results = []
-
-    while True:
-        params["page"] = page
-        data = api_get(path, params=params.copy())
-        if not data:
-            break
-
-        results = data.get("results", data if isinstance(data, list) else [])
-        all_results.extend(results)
-
-        # Check for next page
-        if not data.get("next"):
-            break
-        page += 1
-        time.sleep(REQUEST_DELAY)
-
-    return all_results
-
-
-# ---------------------------------------------------------------------------
-# FETCH MAYBELLINE VARIANTS
-# ---------------------------------------------------------------------------
-
-def fetch_maybelline_variants_from_page(context):
-    """
-    Scrape the Maybelline brand page to get all product QIDs and slugs.
-    Uses Playwright since the page is SSR (no XHR API call for product listing).
-    """
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    from bs4 import BeautifulSoup
-
-    print("  Scraping Vitabiotics brand pages for product list...")
-    all_products = []
-    page_num = 1
-
-    while True:
-        url = f"{BRAND_URL}?page={page_num}" if page_num > 1 else BRAND_URL
-        page = context.new_page()
-        try:
-            page.goto(url, timeout=25000, wait_until="domcontentloaded")
-            time.sleep(2)
-            html = page.content()
-        except Exception as e:
-            print(f"  [!] Page error ({url}): {e}")
-            page.close()
-            break
-        finally:
-            try: page.close()
-            except: pass
-
-        soup = BeautifulSoup(html, "html.parser")
-        found = set()
-        for a in soup.find_all("a", href=re.compile(r"/products/[A-Za-z0-9]+/")):
-            m = re.search(r"/products/([A-Za-z0-9]+)/([^/?#]+)/?", a["href"])
-            if not m: continue
-            qid, slug = m.group(1), m.group(2)
-            if qid in found: continue
-            found.add(qid)
-            title = a.get_text(strip=True) or slug.replace("-", " ").title()
-            # Get image
-            img = ""
-            parent = a.find_parent("div") or a.find_parent("li")
-            if parent:
-                img_tag = parent.find("img")
-                if img_tag:
-                    src = img_tag.get("src") or img_tag.get("data-src") or ""
-                    if "static.prod.qogita.com" in src:
-                        img = src
-            all_products.append({"qid": qid, "slug": slug, "title": title,
-                                  "url": f"https://www.qogita.com/products/{qid}/{slug}/",
-                                  "image": img})
-
-        print(f"  Page {page_num}: {len(found)} products (total: {len(all_products)})")
-        if not found: break
-
-        # Check for next page link
-        if not soup.find("a", href=re.compile(rf"[?&]page={page_num + 1}")):
-            break
-        page_num += 1
-        time.sleep(REQUEST_DELAY + random.uniform(0, 1))
-
-    return all_products
-
-
-# ---------------------------------------------------------------------------
-# FETCH OFFERS FOR A VARIANT
-# ---------------------------------------------------------------------------
-
-def fetch_variant_detail(qid):
-    """
-    Fetch variant detail from /variants/{qid}/offers/ which returns:
-    price, inventory, gtin, images, isInStock, sellerCount etc.
-    Thread-safe.
-    """
-    url = f"{API_BASE}/variants/{qid}/offers/"
-    for attempt in range(3):
-        try:
-            r = requests.get(url, headers=auth_headers(), timeout=15)
-            if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", 10))
-                time.sleep(wait)
-                continue
-            if r.status_code == 401:
-                _token_cache["token"] = None
-                r = requests.get(url, headers=auth_headers(), timeout=15)
-            if r.status_code in (404, 403):
-                return None
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            if attempt < 2:
-                time.sleep(2)
-    return None
-
-    offers = data if isinstance(data, list) else data.get("results", [])
-
-    parsed = []
-    for o in offers:
-        try:
-            parsed.append({
-                "supplier":   o.get("supplierName") or o.get("supplier") or o.get("sellerName", ""),
-                "unit_price": float(o.get("unitPrice") or o.get("price") or o.get("unit_price", 0)),
-                "mov":        float(o.get("mov") or o.get("minimumOrderValue") or o.get("minimum_order_value", 0)),
-                "stock":      int(o.get("quantity") or o.get("stock") or o.get("availableQuantity", 0)),
-                "bundle":     int(o.get("bundleSize") or o.get("bundle_size") or 1),
-            })
-        except (TypeError, ValueError):
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", 30 * (attempt + 1)))
+            print(f"  [!] Rate limited (429) on catalog download — waiting {wait}s (attempt {attempt+1}/{retries})")
+            time.sleep(wait)
             continue
 
-    # Sort by lowest unit price, then lowest MOV as tiebreaker
-    return sorted(parsed, key=lambda o: (o["unit_price"], o["mov"]))
+        if not r.ok:
+            print(f"  [!] Catalog download failed: HTTP {r.status_code}")
+            return None  # request failure — distinct from a genuinely empty result
+
+        text = r.content.decode("utf-8", errors="replace")
+        break
+    else:
+        print(f"  [!] Catalog download still rate limited after {retries} attempts (last status {last_status}) — skipping this run")
+        return None  # request failure — do not try fallback brand names on this
+    reader = csv.DictReader(io.StringIO(text))
+
+    products = []
+    for row in reader:
+        product_url = row.get("Product URL", "") or ""
+        qid_m = re.search(r"/products/([A-Za-z0-9]+)/", product_url)
+        gtin  = (row.get("GTIN", "") or "").strip()
+        qid   = qid_m.group(1) if qid_m else gtin
+
+        cheapest_stock = _safe_int(row.get("Lowest Priced Offer Inventory", ""))
+        total_stock    = _safe_int(row.get("Total Inventory of All Offers", ""))
+        num_offers     = _safe_int(row.get("Number of Offers", "")) or 0
+
+        # In-stock = any inventory exists across any offer
+        in_stock = (total_stock or 0) > 0
+
+        products.append({
+            "qid":            qid,
+            "title":          row.get("Name", "") or "",
+            "url":            product_url or f"https://www.qogita.com/products/{qid}/",
+            "image":          row.get("Image URL", "") or "",
+            "barcode":        gtin,
+            "price":          (row.get("£ Lowest Price inc. shipping", "") or "").strip(),
+            "bundle_size":    (row.get("Unit", "") or "").strip(),
+            "cheapest_stock": cheapest_stock,
+            "stock":          total_stock,
+            "all_offers":     num_offers,
+            "is_preorder":    (row.get("Is a pre-order?", "") or "").strip().lower() == "yes",
+            "delivery_weeks": (row.get("Estimated Delivery Time (weeks)", "") or "").strip(),
+            "in_stock":       in_stock,
+        })
+
+    return products
 
 
-def parse_variant(item, detail=None):
+def fetch_brand_catalog_with_fallback():
     """
-    Build our product dict from the brand page scrape (item)
-    enriched with the variant detail API response (detail).
-
-    detail = response from /variants/{qid}/offers/ which returns:
-      price, inventory, gtin, images, isInStock, sellerCount, fid
+    Try the confirmed brand name first. Only fall back to alternate
+    spellings if the call genuinely succeeded but returned zero rows
+    (wrong name) — NOT if the call failed/was rate limited (None),
+    since retrying with different names during a rate-limit window
+    would just make things worse.
     """
-    # QID — from brand page scrape (fid) or detail (fid/qid)
-    qid  = str(item.get("qid") or "")
-    name = item.get("title") or item.get("name") or ""
-    slug = item.get("slug") or ""
+    print(f"  Fetching catalog for brand_name='{BRAND_NAME}'...")
+    products = fetch_brand_catalog(BRAND_NAME)
 
-    # Start with what we know from the brand page
-    product = {
-        "qid":        qid,
-        "slug":       slug,
-        "title":      name,
-        "url":        item.get("url") or f"https://www.qogita.com/products/{qid}/{slug}/",
-        "image":      item.get("image") or "",
-        "barcode":    "",
-        "price":      "",
-        "stock":      None,
-        "in_stock":   False,
-        "seller_count": 0,
-    }
+    if products is None:
+        print("  [!] Request failed/rate limited — not trying fallback names this run")
+        return []
+    if products:
+        print(f"  Got {len(products)} products")
+        return products
 
-    if detail:
-        # Enrich with API detail
-        product["title"]    = detail.get("name") or name
-        product["barcode"]  = str(detail.get("gtin") or "")
-        product["price"]    = str(detail.get("price") or "")
-        product["stock"]    = detail.get("inventory")
-        product["in_stock"] = bool(detail.get("isInStock", False))
-        product["seller_count"] = int(detail.get("sellerCount") or 0)
+    for alt in BRAND_NAME_FALLBACKS:
+        print(f"  No results for '{BRAND_NAME}' — trying brand_name='{alt}'...")
+        products = fetch_brand_catalog(alt)
+        if products is None:
+            print("  [!] Request failed/rate limited on fallback — stopping fallback attempts this run")
+            return []
+        if products:
+            print(f"  Got {len(products)} products with '{alt}'")
+            return products
 
-        # Image from detail (higher quality)
-        images = detail.get("images") or []
-        if images:
-            product["image"] = images[0].get("url") or product["image"]
-
-        # Use fid as the QID if available
-        fid = detail.get("fid") or detail.get("qid")
-        if fid:
-            product["qid"] = str(fid)
-            product["url"] = f"https://www.qogita.com/products/{fid}/{slug}/"
-
-    return product
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -333,12 +236,16 @@ def safe_float(val):
 # ---------------------------------------------------------------------------
 
 def _base_fields(product):
-    barcode      = product.get("barcode", "")
-    stock        = product.get("stock")
-    in_stock     = product.get("in_stock", True)
-    seller_count = product.get("seller_count", 0)
-    price        = product.get("price", "")
-    sas_url      = selleramp_url(barcode, price)
+    barcode        = product.get("barcode", "")
+    stock          = product.get("stock")
+    cheapest_stock = product.get("cheapest_stock")
+    in_stock       = product.get("in_stock", True)
+    all_offers     = product.get("all_offers", 0)
+    bundle_size    = product.get("bundle_size", "")
+    delivery_weeks = product.get("delivery_weeks", "")
+    is_preorder    = product.get("is_preorder", False)
+    price          = product.get("price", "")
+    sas_url        = selleramp_url(barcode, price)
 
     if stock is not None:
         stock_val = f"**{stock:,} units**"
@@ -348,10 +255,15 @@ def _base_fields(product):
         stock_val = "❌ Out of stock"
 
     fields = [
-        {"name": "🔢 GTIN / EAN",   "value": f"`{barcode}`" if barcode else "-",      "inline": True},
-        {"name": "📊 Stock",         "value": stock_val,                                "inline": True},
-        {"name": "🏭 Sellers",       "value": f"{seller_count}" if seller_count else "-", "inline": True},
+        {"name": "🔢 GTIN / EAN",        "value": f"`{barcode}`" if barcode else "-",          "inline": True},
+        {"name": "📊 Total Stock",        "value": stock_val,                                    "inline": True},
+        {"name": "📊 Cheapest Offer Stock", "value": f"{cheapest_stock:,} units" if cheapest_stock is not None else "-", "inline": True},
+        {"name": "🏭 Sellers",            "value": f"{all_offers}" if all_offers else "-",       "inline": True},
+        {"name": "📦 Unit / Bundle",      "value": bundle_size if bundle_size else "-",          "inline": True},
+        {"name": "🚚 Delivery",           "value": f"{delivery_weeks} wks" if delivery_weeks else "-", "inline": True},
     ]
+    if is_preorder:
+        fields.append({"name": "⏳ Pre-order", "value": "Yes", "inline": True})
     if sas_url:
         fields.append({
             "name":   "🔍 SellerAmp SAS",
@@ -383,7 +295,7 @@ def _thumbnail(product):
 def notify_new(product):
     price = product.get("price", "")
     fields = [
-        {"name": "💰 Lowest Unit Price", "value": f"**£{price}**" if price else "-",   "inline": True},
+        {"name": "💰 Lowest Price (incl. shipping)", "value": f"**£{price}**" if price else "-",   "inline": True},
         {"name": "💷 Price (inc. VAT)",  "value": f"£{vat_price(price)}" if price else "-", "inline": True},
     ] + _base_fields(product)
 
@@ -402,31 +314,25 @@ def notify_new(product):
 
 
 def notify_price_change(product, old_price, new_price, pct_change):
-    """
-    pct_change is a fraction (e.g. 0.05 = 5% drop). Always a drop —
-    price increases are no longer tracked.
-    Colour tier scales with drop severity for quick visual triage.
-    """
     old_f = safe_float(old_price)
     new_f = safe_float(new_price)
     diff  = f"£{abs(new_f - old_f):.2f}" if old_f and new_f else "?"
     pct_display = f"{pct_change * 100:.1f}%"
 
-    # Colour tiers by drop severity
     if pct_change >= 0.20:
-        colour = 0x00C853   # deep green — big drop (20%+)
+        colour = 0x00C853
         tier   = "🔥"
     elif pct_change >= 0.10:
-        colour = 0x2ECC71   # green — solid drop (10-20%)
+        colour = 0x2ECC71
         tier   = "💰"
     else:
-        colour = 0x82E0AA   # light green — small drop (1-10%)
+        colour = 0x82E0AA
         tier   = "💵"
 
     fields = [
-        {"name": "💰 Old Price", "value": f"£{old_price}",                                          "inline": True},
-        {"name": "💰 New Price", "value": f"**£{new_price}**",                                      "inline": True},
-        {"name": "📉 Drop",      "value": f"↓ {diff} (**{pct_display}**)",                          "inline": True},
+        {"name": "💰 Old Price", "value": f"£{old_price}",     "inline": True},
+        {"name": "💰 New Price", "value": f"**£{new_price}**", "inline": True},
+        {"name": "📉 Drop",      "value": f"↓ {diff} (**{pct_display}**)", "inline": True},
         {"name": "💷 New Price (inc. VAT)", "value": f"£{vat_price(new_price)}" if new_price else "-", "inline": True},
     ] + _base_fields(product)
 
@@ -447,7 +353,7 @@ def notify_price_change(product, old_price, new_price, pct_change):
 def notify_back_in_stock(product):
     price = product.get("price", "")
     fields = [
-        {"name": "💰 Lowest Unit Price", "value": f"**£{price}**" if price else "-",       "inline": True},
+        {"name": "💰 Lowest Price (incl. shipping)", "value": f"**£{price}**" if price else "-",       "inline": True},
         {"name": "💷 Price (inc. VAT)",  "value": f"£{vat_price(price)}" if price else "-", "inline": True},
     ] + _base_fields(product)
 
@@ -471,28 +377,46 @@ def notify_back_in_stock(product):
 
 def load_snapshot():
     if os.path.exists(SNAPSHOT_FILE):
-        with open(SNAPSHOT_FILE) as f:
-            return json.load(f)
+        try:
+            with open(SNAPSHOT_FILE) as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"  [!] Snapshot file is corrupted ({e}) — backing it up and starting fresh.")
+            try:
+                backup_name = f"{SNAPSHOT_FILE}.corrupted.{int(time.time())}"
+                os.rename(SNAPSHOT_FILE, backup_name)
+                print(f"  [!] Corrupted file saved as {backup_name}")
+            except OSError as backup_err:
+                print(f"  [!] Could not back up corrupted file: {backup_err}")
+            return {}
     return {}
 
 
 def save_snapshot(data):
-    with open(SNAPSHOT_FILE, "w") as f:
+    """Write atomically — write to a temp file then rename, so a crash
+    mid-write never leaves a corrupted snapshot.json behind."""
+    tmp_file = f"{SNAPSHOT_FILE}.tmp"
+    with open(tmp_file, "w") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp_file, SNAPSHOT_FILE)
 
 
 def snapshot_entry(product):
     return {
-        "title":       product.get("title", ""),
-        "url":         product.get("url", ""),
-        "image":       product.get("image", ""),
-        "barcode":     product.get("barcode", ""),
-        "price":       product.get("price", ""),
-        "stock":       product.get("stock"),
-        "in_stock":    product.get("in_stock", True),
-        "seller_count": product.get("seller_count", 0),
-        "first_seen":  product.get("first_seen", datetime.now(timezone.utc).isoformat()),
-        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "title":          product.get("title", ""),
+        "url":            product.get("url", ""),
+        "image":          product.get("image", ""),
+        "barcode":        product.get("barcode", ""),
+        "price":          product.get("price", ""),
+        "stock":          product.get("stock"),
+        "cheapest_stock": product.get("cheapest_stock"),
+        "all_offers":     product.get("all_offers", 0),
+        "bundle_size":    product.get("bundle_size", ""),
+        "delivery_weeks": product.get("delivery_weeks", ""),
+        "is_preorder":    product.get("is_preorder", False),
+        "in_stock":       product.get("in_stock", True),
+        "first_seen":     product.get("first_seen", datetime.now(timezone.utc).isoformat()),
+        "last_updated":   datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -504,7 +428,8 @@ def check_changes(product, old):
     """
     Only fires alerts for:
       - Back in stock (was OOS, now has stock)
-      - Price drop (lowest unit price decreased by more than 1%)
+      - Price drop (lowest unit price decreased by more than 1%
+        AND more than £0.02 absolute, to avoid rounding noise)
     No alerts for: price increases, stock fluctuations, going OOS.
     """
     old_price    = old.get("price", "")
@@ -519,14 +444,11 @@ def check_changes(product, old):
     old_f = safe_float(old_price)
     new_f = safe_float(new_price)
 
-    # Back in stock takes priority over price comparison
     if not was_in_stock and now_in_stock:
         notify_back_in_stock(product)
         time.sleep(1)
         return
 
-    # Price drop — require at least 1% AND £0.02 absolute difference
-    # to avoid noise from rounding/floating point drift
     if old_f and new_f and old_f > 0:
         pct_change = (old_f - new_f) / old_f
         abs_change = old_f - new_f
@@ -542,71 +464,26 @@ def check_changes(product, old):
 def run_check():
     print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Checking Qogita Vitabiotics...")
 
-    snapshot     = load_snapshot()
-    known_qids   = set(snapshot.keys())
-    # Use a flag file to mark baseline as complete — avoids re-alerting
-    # if snapshot partially saved on first run
-    baseline_done = os.path.exists("baseline_done_vitabiotics.txt")
+    snapshot      = load_snapshot()
+    known_qids    = set(snapshot.keys())
+    baseline_done = os.path.exists(BASELINE_FLAG)
     is_first_run  = not baseline_done
 
-    # 1. Scrape brand page for product list (SSR, needs browser)
-    #    Then use API for offers per product (needs auth token)
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-        )
-        try:
-            variants = fetch_maybelline_variants_from_page(context)
-        finally:
-            browser.close()
-
-    if not variants:
-        print("  [!] No variants found on brand page")
+    products = fetch_brand_catalog_with_fallback()
+    if not products:
+        print("  [!] No products returned from catalog API")
         return
 
-    current_qids = {str(v.get("qid") or v.get("id", "")) for v in variants}
+    current_qids = {p["qid"] for p in products if p.get("qid")}
     new_qids     = current_qids - known_qids
-    print(f"  {len(variants)} variants, {len(new_qids)} new")
 
-    # 2. Fetch all offers in parallel (10 concurrent workers)
-    print(f"  Fetching offers for {len(variants)} products (10 parallel workers)...")
+    if is_first_run:
+        print(f"  First run — building baseline from {len(products)} products (no alerts)...")
+    else:
+        print(f"  {len(products)} products fetched, {len(new_qids)} new")
 
-    def fetch_and_parse(item):
-        qid = str(item.get("qid") or "")
-        if not qid:
-            return None
-        detail = fetch_variant_detail(qid)
-        # If API returns None (404/error), skip this product entirely
-        # rather than recording it as OOS
-        if detail is None:
-            return None
-        product = parse_variant(item, detail)
-        return product
-
-    products_with_offers = []
-    completed = 0
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_and_parse, item): item for item in variants}
-        for future in as_completed(futures):
-            try:
-                product = future.result()
-                if product:
-                    products_with_offers.append(product)
-            except Exception as e:
-                print(f"  [!] Error fetching offers: {e}")
-            completed += 1
-            if completed % 100 == 0:
-                print(f"  [{completed}/{len(variants)}] offers fetched...")
-                save_snapshot(snapshot)
-
-    print(f"  All offers fetched — processing {len(products_with_offers)} products...")
-
-    # 3. Process results
-    for product in products_with_offers:
-        qid = product.get("qid", "")
+    for product in products:
+        qid = product.get("qid")
         if not qid:
             continue
 
@@ -615,10 +492,7 @@ def run_check():
             entry["first_seen"] = datetime.now(timezone.utc).isoformat()
             snapshot[qid] = entry
         elif qid in new_qids:
-            # Skip new listing alert if product is out of stock
-            if not product.get("in_stock") or not product.get("stock"):
-                pass
-            else:
+            if product.get("in_stock", True):
                 print(f"  -> NEW: {product['title'][:60]}")
                 notify_new(product)
                 time.sleep(1.5)
@@ -626,15 +500,16 @@ def run_check():
             entry["first_seen"] = datetime.now(timezone.utc).isoformat()
             snapshot[qid] = entry
         else:
-            check_changes(product, snapshot[qid])
+            old = snapshot[qid]
+            check_changes(product, old)
             entry = snapshot_entry(product)
-            entry["first_seen"] = snapshot[qid].get("first_seen", entry["first_seen"])
+            entry["first_seen"] = old.get("first_seen", entry["first_seen"])
             snapshot[qid] = entry
 
     save_snapshot(snapshot)
+
     if is_first_run:
-        # Mark baseline as done so subsequent runs fire alerts
-        with open("baseline_done_vitabiotics.txt", "w") as f:
+        with open(BASELINE_FLAG, "w") as f:
             f.write(datetime.now(timezone.utc).isoformat())
         print(f"  Baseline complete — {len(snapshot)} products. No alerts sent.")
     else:
@@ -643,9 +518,9 @@ def run_check():
 
 def main():
     print("=" * 55)
-    print("  Qogita Vitabiotics Monitor (API-based)")
-    print(f"  Brand: {BRAND_URL}")
-    print("  Tracking: new listings, price drops, restocks")
+    print("  Qogita Vitabiotics Monitor (Catalog Download API)")
+    print(f"  Brand: {BRAND_PAGE_URL}")
+    print("  Tracking: new listings, price drops, back in stock")
     print("=" * 55)
 
     if not QOGITA_EMAIL or not QOGITA_PASSWORD:
