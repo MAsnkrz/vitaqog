@@ -2,7 +2,7 @@ name: Qogita Vitabiotics Monitor
 
 on:
   schedule:
-    - cron: "*/30 * * * *"  # every 15 minutes
+    - cron: "*/15 * * * *"  # every 15 minutes
   workflow_dispatch:
 
 env:
@@ -14,7 +14,7 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repo
@@ -28,10 +28,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests playwright beautifulsoup4
-
-      - name: Install Playwright browsers
-        run: python -m playwright install chromium --with-deps
+        run: pip install requests
 
       - name: Run monitor
         env:
