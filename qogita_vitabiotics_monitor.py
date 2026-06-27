@@ -50,6 +50,22 @@ QOGITA_EMAIL    = os.getenv("QOGITA_EMAIL",    "")
 QOGITA_PASSWORD = os.getenv("QOGITA_PASSWORD", "")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
+# Some API gateways/WAFs treat requests differently depending on headers
+# (e.g. the bare default `python-requests/x.x` User-Agent can be flagged
+# or routed differently than a browser-like client, especially from
+# datacenter/cloud IP ranges like GitHub Actions runners). Use a shared
+# session with realistic headers for every call to Qogita's API.
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/csv, application/json, */*",
+    "Accept-Language": "en-GB,en;q=0.9",
+})
+
 # Discord colours
 COLOUR_NEW  = 0xE91E8C   # pink — new listing
 COLOUR_BACK = 0x9B59B6   # purple — back in stock
@@ -69,7 +85,7 @@ def get_token():
         return _token_cache["token"]
 
     print("  Authenticating with Qogita API...")
-    r = requests.post(
+    r = SESSION.post(
         f"{API_BASE}/auth/login/",
         json={"email": QOGITA_EMAIL, "password": QOGITA_PASSWORD},
         timeout=15,
@@ -115,12 +131,12 @@ def fetch_brand_catalog(brand_name, retries=4):
     last_status = None
 
     for attempt in range(retries):
-        r = requests.get(url, headers=auth_headers(), params={"brand_name": brand_name}, timeout=60)
+        r = SESSION.get(url, headers=auth_headers(), params={"brand_name": brand_name}, timeout=60)
         last_status = r.status_code
 
         if r.status_code == 401:
             _token_cache["token"] = None
-            r = requests.get(url, headers=auth_headers(), params={"brand_name": brand_name}, timeout=60)
+            r = SESSION.get(url, headers=auth_headers(), params={"brand_name": brand_name}, timeout=60)
             last_status = r.status_code
 
         if r.status_code == 429:
@@ -131,6 +147,8 @@ def fetch_brand_catalog(brand_name, retries=4):
 
         if not r.ok:
             print(f"  [!] Catalog download failed: HTTP {r.status_code}")
+            print(f"  [!] Response headers: {dict(r.headers)}")
+            print(f"  [!] Response body (first 500 chars): {r.text[:500]}")
             return None  # request failure — distinct from a genuinely empty result
 
         text = r.content.decode("utf-8", errors="replace")
